@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import sys
@@ -11,6 +10,8 @@ from pydantic import BaseModel
 
 from backend.agent import AgenticRAG
 from backend.agent.agent_state import AgentState
+from backend.cache.semantic_cache import SemanticCache
+from backend.shared.models import GeneratedAnswer, RetrievalResult
 from backend.history import store as history_store
 from backend.graph.service import service as graph_service
 from backend.documents import store as documents_store
@@ -40,6 +41,21 @@ app.add_middleware(
 
 agent: Optional[AgenticRAG] = None
 agent_stream: Optional[AgenticRAG] = None
+semantic_cache: Optional[SemanticCache] = None
+_cache_init_failed = False
+
+
+def get_cache() -> Optional[SemanticCache]:
+    """懒初始化语义缓存;Redis/ChromaDB 不可用时降级为无缓存,不影响主流程。"""
+    global semantic_cache, _cache_init_failed
+    if semantic_cache is None and not _cache_init_failed:
+        try:
+            semantic_cache = SemanticCache()
+            print("[main] 语义缓存已启用 (Redis 精确层 + ChromaDB 语义层)")
+        except Exception as e:
+            _cache_init_failed = True
+            print(f"[main] 语义缓存初始化失败,本次运行禁用缓存: {e}")
+    return semantic_cache
 
 
 class AskRequest(BaseModel):
@@ -61,6 +77,8 @@ class AskResponse(BaseModel):
     steps: List[StepInfo]
     intent: str
     evaluation_result: str
+    from_cache: bool = False
+    cache_similarity: float = 0.0
 
 
 class SaveConversationRequest(BaseModel):
@@ -73,7 +91,7 @@ class SaveConversationRequest(BaseModel):
 async def get_agent() -> AgenticRAG:
     global agent
     if agent is None:
-        agent = AgenticRAG(max_retrieval_attempts=2)
+        agent = AgenticRAG(max_retrieval_attempts=2, cache=get_cache())
     return agent
 
 
@@ -84,21 +102,26 @@ async def get_agent_stream() -> AgenticRAG:
         agent_stream = AgenticRAG(
             max_retrieval_attempts=2,
             include_generate=False,
+            cache=agent.cache,
         )
         agent_stream.generator = agent.generator
     return agent_stream
 
 
 def reset_agents():
-    global agent, agent_stream
+    global agent, agent_stream, semantic_cache, _cache_init_failed
     agent = None
     agent_stream = None
+    # 文档重建后旧缓存答案可能失效,一并重置
+    semantic_cache = None
+    _cache_init_failed = False
 
 
 build_service.register_on_finished(reset_agents)
 
 
 GRAPH_STEP_NAMES = {
+    "semantic_cache": "语义缓存检查 (命中直接返回)",
     "classify": "意图分类 (判断是否需要检索)",
     "direct_answer": "直接回答 (无检索)",
     "optimize_query": "查询优化 (清洗->关键词->改写)",
@@ -108,6 +131,26 @@ GRAPH_STEP_NAMES = {
     "process_documents": "文档后处理 (排序去重)",
     "generate": "答案生成 (LLM)",
 }
+
+
+def cache_hit_step(cached: dict) -> StepInfo:
+    return StepInfo(
+        node="semantic_cache",
+        description="语义缓存命中",
+        details={
+            "hit": True,
+            "similarity": round(cached.get("similarity", 1.0), 4),
+            "cached_query": cached.get("query", ""),
+        },
+    )
+
+
+def cache_miss_step() -> StepInfo:
+    return StepInfo(
+        node="semantic_cache",
+        description="语义缓存未命中",
+        details={"hit": False},
+    )
 
 
 def extract_step_details(node_name: str, state: dict) -> dict:
@@ -154,12 +197,45 @@ async def run_graph_with_collect(agent: AgenticRAG, query: str):
     full_state = initial_state.model_dump()
     steps: List[StepInfo] = []
 
+    # 语义缓存:命中则直接返回,不跑图
+    if agent.cache:
+        cached = agent.cache.get(query)
+        if cached:
+            answer = GeneratedAnswer(
+                answer=cached["answer"],
+                sources=[
+                    RetrievalResult(**s) if isinstance(s, dict) else s
+                    for s in cached.get("sources", [])
+                ],
+                model="semantic_cache",
+                from_cache=True,
+                cache_similarity=cached.get("similarity", 1.0),
+            )
+            full_state["answer"] = answer
+            full_state["documents"] = []
+            steps.append(cache_hit_step(cached))
+            return full_state, steps
+        steps.append(cache_miss_step())
+
     async for event in agent._graph.astream(full_state, stream_mode="updates"):
         for node_name, node_state in event.items():
             full_state.update(node_state)
             description = GRAPH_STEP_NAMES.get(node_name, node_name)
             details = extract_step_details(node_name, node_state)
             steps.append(StepInfo(node=node_name, description=description, details=details))
+
+    # 生成完成且非缓存来源 → 写回语义缓存
+    if agent.cache:
+        answer = full_state.get("answer")
+        if answer and not answer.from_cache:
+            agent.cache.set(
+                query=query,
+                answer=answer.answer,
+                sources=[
+                    d.__dict__ if hasattr(d, "__dict__") else d
+                    for d in full_state.get("documents", [])
+                ],
+            )
 
     return full_state, steps
 
@@ -170,6 +246,16 @@ async def run_graph_streaming(agent_stream_inst: AgenticRAG, agent_full: Agentic
         max_retrieval_attempts=agent_stream_inst._max_attempts,
     )
     full_state = initial_state.model_dump()
+
+    # 语义缓存:命中则直接返回缓存答案,不跑图、不调 LLM
+    cache = agent_stream_inst.cache
+    if cache:
+        cached = cache.get(query)
+        if cached:
+            yield f"data: {json.dumps(cache_hit_step(cached).model_dump(), ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'answer': cached['answer'], 'sources': cached.get('sources', []), 'model': 'semantic_cache', 'from_cache': True, 'similarity': cached.get('similarity', 1.0)}, ensure_ascii=False)}\n\n"
+            return
+        yield f"data: {json.dumps(cache_miss_step().model_dump(), ensure_ascii=False)}\n\n"
 
     try:
         async for event in agent_stream_inst._graph.astream(full_state, stream_mode="updates"):
@@ -207,7 +293,11 @@ async def run_graph_streaming(agent_stream_inst: AgenticRAG, agent_full: Agentic
             "chapter": getattr(s, 'metadata', {}).get('chapter', ''),
         })
 
-    yield f"data: {json.dumps({'type': 'done', 'answer': full_text, 'sources': sources_list, 'model': agent_full.generator._llm.model}, ensure_ascii=False)}\n\n"
+    # 生成完成 → 写回语义缓存
+    if cache and full_text:
+        cache.set(query=query, answer=full_text, sources=sources_list)
+
+    yield f"data: {json.dumps({'type': 'done', 'answer': full_text, 'sources': sources_list, 'model': agent_full.generator._llm.model, 'from_cache': False, 'similarity': 0.0}, ensure_ascii=False)}\n\n"
 
 
 @app.post("/ask", response_model=AskResponse)
@@ -228,7 +318,6 @@ async def ask(req: AskRequest):
             intent=full_state.get("intent", ""),
             evaluation_result=full_state.get("evaluation_result", ""),
         )
-
     sources_list = []
     if hasattr(answer, 'sources') and answer.sources:
         for s in answer.sources:
@@ -251,6 +340,8 @@ async def ask(req: AskRequest):
         steps=steps,
         intent=full_state.get("intent", ""),
         evaluation_result=full_state.get("evaluation_result", ""),
+        from_cache=bool(getattr(answer, "from_cache", False)),
+        cache_similarity=getattr(answer, "cache_similarity", None) or 0.0,
     )
 
 

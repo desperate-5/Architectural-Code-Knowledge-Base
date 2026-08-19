@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -18,3 +18,4 @@ class GeneratedAnswer:
     model: str = ""
     usage: dict = field(default_factory=dict)
     from_cache: bool = False
+    cache_similarity: Optional[float] = None

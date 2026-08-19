@@ -2,6 +2,7 @@ import { useState, useRef, useCallback } from 'react'
 import { flushSync } from 'react-dom'
 
 const NODE_LABELS = {
+  semantic_cache: { title: '语义缓存', desc: '检查历史问答是否命中' },
   classify: { title: '意图分类', desc: '判断是否需要检索' },
   direct_answer: { title: '直接回答', desc: '无检索，直接回答' },
   optimize_query: { title: '查询优化', desc: '清洗 → 关键词 → 改写' },
@@ -79,14 +80,17 @@ export function useAsk(onSaved) {
               const updated = [...prev]
               updated[idx] = {
                 ...updated[idx],
+                content: data.answer || updated[idx].content,
                 sources: data.sources || [],
                 model: data.model || '',
                 usage: data.usage || {},
+                from_cache: data.from_cache || false,
+                cache_similarity: data.similarity || 0,
               }
               return updated
             })
             if (onSaved) {
-              onSaved({ query, answer: data.answer || '', sources: data.sources || [], model: data.model || '' })
+              onSaved({ query, answer: data.answer || '', sources: data.sources || [], model: data.model || '', from_cache: data.from_cache || false })
             }
           } else if (data.type === 'step') {
             setCurrentSteps((prev) => [...prev, {

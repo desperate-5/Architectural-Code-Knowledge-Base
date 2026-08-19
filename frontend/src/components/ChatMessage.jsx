@@ -4,14 +4,27 @@ import remarkGfm from 'remark-gfm'
 export default function ChatMessage({ message }) {
   const isUser = message.role === 'user'
   const isAssistant = message.role === 'assistant'
+  const fromCache = isAssistant && message.from_cache
 
   return (
     <div className={`message ${isUser ? 'message-user' : 'message-assistant'}`}>
       <div className="message-avatar">{isUser ? '👤' : '🤖'}</div>
       <div className="message-body">
         <div className="message-name">{isUser ? '你' : '建筑规范助手'}</div>
-        {isAssistant && message.model && (
-          <div className="message-meta">模型: {message.model}</div>
+        {fromCache ? (
+          <div className="message-cache-badge">
+            ⚡ 语义缓存命中
+            {message.cache_similarity
+              ? ` · 相似度 ${(message.cache_similarity * 100).toFixed(0)}%`
+              : ''}
+          </div>
+        ) : (
+          isAssistant &&
+          message.model && (
+            <div className="message-meta">
+              模型: {message.model === 'semantic_cache' ? '语义缓存' : message.model}
+            </div>
+          )
         )}
         <div className={`message-content ${isAssistant ? 'markdown-body' : ''}`}>
           {isAssistant ? (

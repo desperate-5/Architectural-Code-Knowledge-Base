@@ -16,5 +16,7 @@ class LLMClient:
         self.client = OpenAI(
             api_key=settings.DEEPSEEK_API_KEY,
             base_url=settings.DEEPSEEK_BASE_URL,
+            timeout=120.0,
+            max_retries=1,
         )
         self.model = settings.DEEPSEEK_MODEL

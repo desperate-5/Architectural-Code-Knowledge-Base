@@ -1,4 +1,5 @@
 const NODE_ICONS = {
+  semantic_cache: '⚡',
   classify: '🧠',
   direct_answer: '💬',
   optimize_query: '🔧',

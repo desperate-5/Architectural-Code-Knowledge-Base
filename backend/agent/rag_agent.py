@@ -1,4 +1,3 @@
-import asyncio
 from typing import List, Optional
 
 from langgraph.graph import StateGraph, END
@@ -103,7 +102,9 @@ class AgenticRAG:
             "answer": GeneratedAnswer(
                 answer=cached["answer"],
                 sources=[RetrievalResult(**s) if isinstance(s, dict) else s for s in cached.get("sources", [])],
+                model="semantic_cache",
                 from_cache=True,
+                cache_similarity=cached.get("similarity", 1.0),
             ),
             "documents": [],
             "optimized_query": None,
@@ -115,38 +116,23 @@ class AgenticRAG:
             if cached:
                 return self._from_cache(cached)
 
-        locked = False
-        if self.cache:
-            for _ in range(3):
-                if self.cache.acquire_lock(query):
-                    locked = True
-                    break
-                await asyncio.sleep(0.5)
-                cached = self.cache.get(query)
-                if cached:
-                    return self._from_cache(cached)
+        state = AgentState(
+            query=query,
+            max_retrieval_attempts=self._max_attempts,
+        )
 
-        try:
-            state = AgentState(
+        result = await self._graph.ainvoke(state)
+        answer: Optional[GeneratedAnswer] = result.get("answer")
+        documents: List[RetrievalResult] = result.get("documents", [])
+
+        if self.cache and answer and not answer.from_cache:
+            self.cache.set(
                 query=query,
-                max_retrieval_attempts=self._max_attempts,
+                answer=answer.answer,
+                sources=[d.__dict__ if hasattr(d, "__dict__") else d for d in documents],
             )
 
-            result = await self._graph.ainvoke(state)
-            answer: Optional[GeneratedAnswer] = result.get("answer")
-            documents: List[RetrievalResult] = result.get("documents", [])
-
-            if self.cache and answer and not answer.from_cache:
-                self.cache.set(
-                    query=query,
-                    answer=answer.answer,
-                    sources=[d.__dict__ if hasattr(d, "__dict__") else d for d in documents],
-                )
-
-            return result
-        finally:
-            if self.cache and locked:
-                self.cache.release_lock(query)
+        return result
 
 
 agent_app = AgenticRAG()

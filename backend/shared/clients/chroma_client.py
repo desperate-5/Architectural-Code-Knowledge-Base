@@ -21,6 +21,9 @@ class ChromaClient:
             metadata={"hnsw:space": "cosine"},
         )
 
+    def get_or_create_collection(self, name: str, metadata: dict = None):
+        return self._client.get_or_create_collection(name, metadata=metadata)
+
     def reset(self):
         self._client.delete_collection(self.collection_name)
         self.collection = self._client.get_or_create_collection(

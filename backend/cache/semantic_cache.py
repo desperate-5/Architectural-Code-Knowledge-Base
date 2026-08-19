@@ -11,7 +11,7 @@ from backend.shared.clients import EmbedClient, ChromaClient
 class SemanticCache:
     def __init__(
         self,
-        similarity_threshold: float = 0.92,
+        similarity_threshold: float = 0.95,
         ttl: int = 3600,
         max_entries: int = 1000,
         redis_url: str = "redis://localhost:6379/0",
